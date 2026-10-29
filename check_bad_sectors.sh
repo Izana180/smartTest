@@ -3,10 +3,18 @@
 # 不良セクタ数 = Reallocated_Sector_Ct(5) + Current_Pending_Sector(197) + Offline_Uncorrectable(198)
 # 不良セクタが 0 のディスクは、マウント先に約1GBのテストファイルを書き込み・読み戻して
 # チェックサムを比較する。テストファイルは終了時(中断時含む)に必ず削除する。
-# 使い方: sudo ./check_bad_sectors.sh   (テストサイズ変更: TEST_MB=512 ./check_bad_sectors.sh)
+# 使い方: sudo ./check_bad_sectors.sh [-h] [DEVICE...]
+#   DEVICE を省略すると全ディスクが対象。例: sudo ./check_bad_sectors.sh /dev/sda sdb
+#   テストサイズ変更: TEST_MB=512 ./check_bad_sectors.sh
 
 TEST_MB=${TEST_MB:-1024}
 TESTFILE=""
+
+case $1 in
+    -h|--help)
+        sed -n '6,8p' "$0" | sed 's/^# \{0,1\}//'
+        exit 0 ;;
+esac
 
 if ! command -v smartctl >/dev/null 2>&1; then
     echo "smartctl not found (macOS: brew install smartmontools / Linux: apt install smartmontools)" >&2
@@ -80,25 +88,48 @@ io_test() {
     [ -n "$wsum" ] && [ "$wsum" = "$rsum" ]
 }
 
+# 引数でディスクが指定されていればそれだけ、なければ全ディスクを対象にする
+if [ $# -gt 0 ]; then
+    devices=""
+    for arg in "$@"; do
+        case $arg in
+            /*) d=$arg ;;
+            *)  d=/dev/$arg ;;
+        esac
+        if [ ! -e "$d" ]; then
+            echo "$arg: no such device" >&2
+            exit 2
+        fi
+        devices="$devices $d"
+    done
+else
+    devices=$(smartctl --scan | awk '{print $1}')
+fi
+
 total=0
 io_failed=0
 
-for dev in $(smartctl --scan | awk '{print $1}'); do
-    attrs=$(smartctl -A "$dev" 2>/dev/null)
+for dev in $devices; do
+    # USB-SATA ブリッジは -d sat でないと SMART を返さないことがあるため、順に試す
+    attrs=""
+    for dtype in "" "-d sat"; do
+        attrs=$(smartctl -A $dtype "$dev" 2>/dev/null)
+        printf '%s\n' "$attrs" | grep -q 'RAW_VALUE' && break
+        attrs=""
+    done
 
-    # 属性テーブルがない(NVMe等)デバイスは対象外
-    if ! printf '%s\n' "$attrs" | grep -q 'RAW_VALUE'; then
-        echo "$dev Failed: N/A"
-        continue
+    if [ -n "$attrs" ]; then
+        # 先頭の数値部分のみを RAW 値として加算する
+        count=$(printf '%s\n' "$attrs" | awk '$1==5 || $1==197 || $1==198 {s += $10+0} END {print s+0}')
+        echo "$dev Failed: $count"
+        total=$((total + count))
+    else
+        # SMART が読めなくても読み書きテストは行う
+        count=0
+        echo "$dev Failed: N/A (SMART unavailable)"
     fi
 
-    # 先頭の数値部分のみを RAW 値として加算する
-    count=$(printf '%s\n' "$attrs" | awk '$1==5 || $1==197 || $1==198 {s += $10+0} END {print s+0}')
-
-    echo "$dev Failed: $count"
-    total=$((total + count))
-
-    # 不良セクタ0(SMART上はpass)のディスクのみ実読み書きテスト
+    # 不良セクタ0(または SMART 取得不可)のディスクのみ実読み書きテスト
     if [ "$count" -eq 0 ]; then
         io_test "$dev"
         case $? in
